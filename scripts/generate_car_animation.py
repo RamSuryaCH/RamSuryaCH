@@ -8,20 +8,19 @@ Writes two files into --outdir:
   car-animation-dark.svg
   car-animation-light.svg
 
-A top-down sports car drives once, left to right, across the user's public contribution
-calendar. Data comes from the GraphQL API when GITHUB_TOKEN is set, otherwise from the
-public contributions page. Cells ahead of the car stay near-black. Every cell the car has
-passed fills with a scattered confetti of pink, violet, purple and amber, chosen by a stable
-hash of the cell position. Days with real contributions are brighter and more saturated,
-rising gently with the contribution level 1..4; empty days are still colourful, just softer.
-The car throws one large, soft white tire-smoke cloud from its rear and sides, plus a faint
-wide haze that trails behind it over the coloured cells.
+A top-down sports car drives once, left to right, across the user's real public
+contribution calendar (the last 53 weeks, Sunday on top), coloured with GitHub's own
+contribution-level palette. Data comes from the GraphQL contributionCalendar API when a
+token is available (GITHUB_TOKEN, GH_TOKEN, or `gh auth token`), otherwise from the public
+contributions page. Empty days stay at level 0. The car may briefly brighten each cell as
+it passes; once it has gone, every cell shows its true level, so the settled frame is the
+real graph. The car throws one large, soft white tire-smoke cloud from its rear and sides,
+plus a faint wide haze that trails behind it.
 
 Standard library only. Output is deterministic for the same input data.
 """
 
 import argparse
-import colorsys
 import datetime as dt
 import html
 import json
@@ -29,6 +28,7 @@ import math
 import os
 import random
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -100,23 +100,19 @@ HAZE_LIFE = 0.19
 HAZE_R0, HAZE_R1 = 38, 62
 HAZE_SEED = 7
 
-# Confetti colours for passed cells (dark theme), picked per cell by a stable hash.
-CONFETTI_DARK = ("#e060a0", "#b060e0", "#8060d0", "#f0b060")   # pink, violet, purple, amber
-CONFETTI_LIGHT = ("#ec88b8", "#c392ee", "#9f8ce2", "#f5c387")  # softer pastels
-# Opacity of a passed cell with no contributions, and the extra it gains per level 1..4.
-EMPTY_ALPHA = 0.85
-LEVEL_ALPHA = {1: 0.9, 2: 0.94, 3: 0.97, 4: 1.0}
-# Saturation and brightness multipliers: empty cells are a little muted, real days pop.
-EMPTY_SAT, EMPTY_VAL = 0.85, 0.94
-LEVEL_SAT = {1: 1.0, 2: 1.08, 3: 1.16, 4: 1.24}
-LEVEL_VAL = {1: 1.0, 2: 1.04, 3: 1.08, 4: 1.12}
+# Official GitHub contribution-level colours, index 0..4.
+LEVEL_DARK = ("#161b22", "#0e4429", "#006d32", "#26a641", "#39d353")
+LEVEL_LIGHT = ("#ebedf0", "#9be9a8", "#40c463", "#30a14e", "#216e39")
+# Brief pass glow: a lighter overlay on each real cell, then it returns to its true level.
+GLOW_PEAK_EMPTY = 0.28
+GLOW_PEAK_LIT = 0.62
+GLOW_RISE = 0.012    # loop fraction to reach the glow peak (~0.14 s)
+GLOW_FALL = 0.040    # loop fraction back to the true colour (~0.48 s)
 
 THEMES = {
     "dark": {
         "bg": "url(#bgDark)",
-        "base": "#0d0c16",        # cells ahead of the car: near-black
-        "base_stroke": "#201e35",
-        "confetti": CONFETTI_DARK,
+        "levels": LEVEL_DARK,
         "smoke": "#ffffff",
         "smoke_peak": 0.8,
         "haze_peak": 0.17,
@@ -124,9 +120,7 @@ THEMES = {
     },
     "light": {
         "bg": "#f6f7fb",
-        "base": "#e4e7f0",
-        "base_stroke": "#d3d7e4",
-        "confetti": CONFETTI_LIGHT,
+        "levels": LEVEL_LIGHT,
         "smoke": "#b0b8d0",       # a little darker and bluer than white, so it shows on a light page
         "smoke_peak": 0.85,
         "haze_peak": 0.22,
@@ -143,9 +137,9 @@ LEVEL_FROM_GRAPHQL = {
 }
 
 GRAPHQL_QUERY = """
-query($login: String!, $from: DateTime!, $to: DateTime!) {
+query($login: String!) {
   user(login: $login) {
-    contributionsCollection(from: $from, to: $to) {
+    contributionsCollection {
       contributionCalendar {
         weeks { contributionDays { date contributionCount contributionLevel } }
       }
@@ -172,13 +166,8 @@ class Day:
 # ---------------------------------------------------------------- data fetching
 
 def fetch_graphql(user, token):
-    now = dt.datetime.now(dt.timezone.utc)
-    start = now - dt.timedelta(days=365)
-    variables = {
-        "login": user,
-        "from": start.strftime("%Y-%m-%dT00:00:00Z"),
-        "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
+    # Default contributionsCollection is the same 53-week window GitHub shows on the profile.
+    variables = {"login": user}
     body = json.dumps({"query": GRAPHQL_QUERY, "variables": variables}).encode("utf-8")
     req = urllib.request.Request(
         GRAPHQL_URL,
@@ -246,15 +235,45 @@ def fetch_public_page(user):
     return days
 
 
+def github_token():
+    """Read-only token from the environment, or from the local `gh` login. Never printed."""
+    for key in ("GITHUB_TOKEN", "GH_TOKEN"):
+        token = os.environ.get(key)
+        if token:
+            return token
+    try:
+        proc = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    token = (proc.stdout or "").strip()
+    return token or None
+
+
 def fetch_days(user):
-    token = os.environ.get("GITHUB_TOKEN")
+    token = github_token()
+    graphql_days = None
     if token:
         try:
-            return fetch_graphql(user, token)
+            graphql_days = fetch_graphql(user, token)
         except (urllib.error.URLError, RuntimeError, KeyError, ValueError) as exc:
-            print(f"warning: GraphQL fetch failed ({exc}); using the public contributions page",
+            print(f"warning: GraphQL fetch failed ({exc}); trying the public contributions page",
                   file=sys.stderr)
-    return fetch_public_page(user)
+    try:
+        page_days = fetch_public_page(user)
+    except (urllib.error.URLError, RuntimeError, KeyError, ValueError) as exc:
+        if graphql_days is None:
+            raise
+        print(f"warning: public contributions page failed ({exc}); using GraphQL only",
+              file=sys.stderr)
+        return graphql_days
+    if graphql_days is None:
+        return page_days
+    # Prefer the public calendar's level and count when both sources have a date, so the
+    # settled frame matches the graph GitHub renders on the profile.
+    by_date = {d.date: d for d in graphql_days}
+    for d in page_days:
+        by_date[d.date] = d
+    return list(by_date.values())
 
 
 def build_grid(days):
@@ -346,57 +365,69 @@ def cell_rect(col, row, fill, extra=""):
             f'width="{CELL}" height="{CELL}" rx="{fmt(CELL_RX)}" fill="{fill}"{extra}/>')
 
 
-def trail_cell(col, row, color, peak, width):
-    """A cell that fades to `peak` opacity as the car arrives and holds until the loop ends."""
+def mix_white(hex_color, amount):
+    """Move a hex colour toward white by `amount` (0..1), for the brief pass glow."""
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    r = round(r + (255 - r) * amount)
+    g = round(g + (255 - g) * amount)
+    b = round(b + (255 - b) * amount)
+    return "#{:02x}{:02x}{:02x}".format(r, g, b)
+
+
+def cell_level(day):
+    if day is None:
+        return None
+    if day.count is not None:
+        if day.count <= 0:
+            return 0
+        return min(max(day.level, 1), 4)
+    return min(max(day.level, 0), 4)
+
+
+def real_grid(grid, theme):
+    """One rect per real calendar day, filled with GitHub's colour for that day's level.
+
+    Days that do not exist (for example future weekdays in the current week) are omitted,
+    so the grid never invents a cell.
+    """
+    colors = THEMES[theme]["levels"]
+    out = []
+    for (col, row), day in sorted(grid.items()):
+        level = cell_level(day)
+        if level is None:
+            continue
+        out.append(cell_rect(col, row, colors[level]))
+    return "".join(out)
+
+
+def glow_cell(col, row, color, peak, width):
+    """A short brightness pulse as the car passes, then back to fully transparent."""
     t0 = fill_time(col, row, width)
-    times = [0, t0, t0 + FILL_LEN, TRAIL_HOLD, TRAIL_FADE_END, 1]
-    values = [0, 0, peak, peak, 0, 0]
-    anim = animate("opacity", values, times)
+    t1 = min(t0 + GLOW_RISE, 0.98)
+    t2 = min(t0 + GLOW_RISE + GLOW_FALL, 0.995)
+    if t1 <= t0:
+        t1 = min(t0 + 0.001, 0.99)
+    if t2 <= t1:
+        t2 = min(t1 + 0.001, 0.999)
+    times = [0, t0, t1, t2, 1]
+    anim = animate("opacity", [0, 0, peak, 0, 0], times)
     x = fmt(float(cell_x(col)))
     y = fmt(float(cell_y(row)))
     return (f'<rect x="{x}" y="{y}" width="{CELL}" height="{CELL}" rx="{fmt(CELL_RX)}" '
             f'fill="{color}" opacity="0">{anim}</rect>')
 
 
-def base_grid(ncols, color, stroke):
+def glow_overlay(grid, theme, width):
+    """Brief lighter overlay on each real cell as the car reaches it."""
+    colors = THEMES[theme]["levels"]
     out = []
-    for col in range(ncols):
-        for row in range(ROWS):
-            out.append(cell_rect(col, row, color, f' stroke="{stroke}" stroke-width="0.7"'))
+    for (col, row), day in sorted(grid.items()):
+        level = cell_level(day)
+        if level is None:
+            continue
+        peak = GLOW_PEAK_EMPTY if level == 0 else GLOW_PEAK_LIT
+        out.append(glow_cell(col, row, mix_white(colors[level], 0.55), peak, width))
     return "".join(out)
-
-
-def cell_hash(col, row):
-    """Stable 32-bit mix of (col, row), so colours look scattered and never stripe by column or row."""
-    mask = 0xFFFFFFFF
-    h = (col * 0x9E3779B1 + row * 0x85EBCA6B + 0x27D4EB2F) & mask
-    h ^= h >> 15
-    h = (h * 0x2C1B3C6D) & mask
-    h ^= h >> 12
-    h = (h * 0x297A2D39) & mask
-    h ^= h >> 15
-    return h
-
-
-def tune_color(hex_color, sat, val):
-    r, g, b = (int(hex_color[i:i + 2], 16) / 255 for i in (1, 3, 5))
-    h, s, v = colorsys.rgb_to_hsv(r, g, b)
-    r, g, b = colorsys.hsv_to_rgb(h, min(s * sat, 1.0), min(v * val, 1.0))
-    return "#{:02x}{:02x}{:02x}".format(round(r * 255), round(g * 255), round(b * 255))
-
-
-def passed_cell_style(theme, col, row, level):
-    """(colour, peak opacity) of a cell once the car has passed it.
-
-    The hue is a hash of the position. Empty days are softer; real days are brighter and more
-    saturated, rising gently with contribution level 1..4.
-    """
-    palette = THEMES[theme]["confetti"]
-    base = palette[(cell_hash(col, row) >> 8) % len(palette)]
-    if level <= 0:
-        return tune_color(base, EMPTY_SAT, EMPTY_VAL), EMPTY_ALPHA
-    level = min(level, 4)
-    return tune_color(base, LEVEL_SAT[level], LEVEL_VAL[level]), LEVEL_ALPHA[level]
 
 
 # ---------------------------------------------------------------- car
@@ -750,26 +781,18 @@ def render(days, theme):
     width, height = canvas_size(ncols)
     cy = car_center_y()
 
-    base = base_grid(ncols, palette["base"], palette["base_stroke"])
-    trail = []
-    for col in range(ncols):
-        for row in range(ROWS):
-            day = grid.get((col, row))
-            # Every passed cell fills, including days with no contributions.
-            level = 0 if day is None or not day.is_lit() else max(day.level, 1)
-            color, peak = passed_cell_style(theme, col, row, level)
-            trail.append(trail_cell(col, row, color, peak, width))
+    cells = real_grid(grid, theme)
+    glow = glow_overlay(grid, theme, width)
 
     layers = (
-        base
-        + "".join(trail)
+        cells
+        + glow
         + smoke_layers(width, cy, theme)
         + car_layers(width, cy, theme)
     )
-    desc = ("A light-blue sports car drifts across a contribution graph. Cells ahead of it stay dark. "
-            "Every cell it passes fills with scattered purple, violet, pink and amber, brighter on "
-            "days with contributions and softer on empty days, while the rear tires throw a large "
-            "cloud of white smoke.")
+    desc = ("A light-blue sports car drifts across the real GitHub contribution graph. Each day "
+            "keeps its true contribution level, briefly brightening as the car passes, and the "
+            "rear tires throw a large cloud of white smoke.")
     return svg_document(width, height, theme, "Car contribution animation", desc, layers)
 
 
