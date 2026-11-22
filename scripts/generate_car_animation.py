@@ -89,7 +89,7 @@ REAR_TRACK_Y = AXLES[1][1]  # half track of the rear tyres, |y| in car-local uni
 # canvas. Each puff is born at a rear wheel in world space and then stays put.
 SMOKE_EMIT_EVERY = 0.12   # seconds between puff emissions from each rear tyre
 PUFF_LIFE = 0.075         # loop fraction (0.9 s) from birth to fully faded
-PUFF_R0 = (6.0, 8.0)      # start radius range, about one tyre wide
+PUFF_R0 = (7.2, 9.6)      # start radius range, about one tyre wide, +20%
 PUFF_GROW = (1.15, 1.3)   # end radius = start radius times this factor
 PUFF_DRIFT_BACK = (3.0, 7.0)   # how far a puff slides rearward over its life, local units
 PUFF_DRIFT_OUT = (1.0, 3.0)    # outward slide, away from the car centre line
@@ -115,7 +115,7 @@ THEMES = {
         "levels": LEVEL_NEON_DARK,
         "empty": EMPTY_DARK,
         "smoke": "#ffffff",
-        "smoke_peak": 0.35,
+        "smoke_peak": 0.52,
         "shadow": 0.6,
     },
     "light": {
@@ -123,7 +123,7 @@ THEMES = {
         "levels": LEVEL_NEON_LIGHT,
         "empty": EMPTY_LIGHT,
         "smoke": "#9aa2b6",       # a darker grey than the dark-theme white, so it shows on a light page
-        "smoke_peak": 0.4,
+        "smoke_peak": 0.55,
         "shadow": 0.42,
     },
 }
