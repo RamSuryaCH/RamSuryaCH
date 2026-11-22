@@ -10,14 +10,18 @@ Writes two files into --outdir:
 
 A top-down sports car drives once, left to right, across the user's public contribution
 calendar. Data comes from the GraphQL API when GITHUB_TOKEN is set, otherwise from the
-public contributions page. Only days with real contributions light up in bright neon as
-the car passes. Empty days get a dim glow behind the car so the trail is not sparse, and
-cells ahead of the car stay dark. The car leaves a milky tire-smoke bloom at the rear.
+public contributions page. Cells ahead of the car stay near-black. Every cell the car has
+passed fills with a scattered confetti of pink, violet, purple and amber, chosen by a stable
+hash of the cell position. Days with real contributions are brighter and more saturated,
+rising gently with the contribution level 1..4; empty days are still colourful, just softer.
+The car throws one large, soft white tire-smoke cloud from its rear and sides, plus a faint
+wide haze that trails behind it over the coloured cells.
 
 Standard library only. Output is deterministic for the same input data.
 """
 
 import argparse
+import colorsys
 import datetime as dt
 import html
 import json
@@ -41,7 +45,7 @@ GAP = 3
 PITCH = CELL + GAP
 ROWS = 7
 PAD_X = 24
-PAD_Y = 92
+PAD_Y = 100
 CELL_RX = 2.5
 
 # Animation timing. Everything loops over LOOP_SECONDS.
@@ -52,57 +56,81 @@ FILL_LEN = 0.025    # loop fraction over which one cell lights up (about 0.3 s)
 ROW_STAGGER = 0.0012  # tiny per-row delay so the wave looks organic, not a hard column
 TRAIL_HOLD = 0.90   # the finished trail stays lit until this fraction, then fades
 TRAIL_FADE_END = 0.985
-DRIFT_DEG = -32.0   # negative = nose up-right during the middle of the drift
+DRIFT_DEG = -24.0   # negative = nose up-right during the middle of the drift
 
 # Car center travels from fully off the left edge to fully off the right edge.
 CAR_X_MARGIN = 70
-CAR_HALF_LEN = 50   # car spans local x in [-50, 50]
+CAR_HALF_LEN = 40   # car spans local x in [-40, 40]
 
-# Wheels in car-local coordinates: (x, y, tyre radius). Rear tyres are slightly larger.
-WHEELS = (
-    (30.0, -12.6, 6.4), (30.0, 12.6, 6.4),
-    (-29.0, -14.0, 7.0), (-29.0, 14.0, 7.0),
+# Body extent along the car's x axis (nose to tail). Axles are placed by fraction of this
+# length, measured from the nose: front at 22 percent, rear at 78 percent.
+NOSE_X = 40.0
+TAIL_X = -38.0
+BODY_LEN = NOSE_X - TAIL_X
+FRONT_AXLE_X = NOSE_X - 0.22 * BODY_LEN
+REAR_AXLE_X = NOSE_X - 0.78 * BODY_LEN
+
+# Tyres seen from above: dark rounded rectangles, longer along x (rolling direction) than y.
+# Per axle: (axle x, half track |y|, tread length, tread width, steer degrees). Each axle
+# yields a left and a right tyre at exactly +-|y|. The body is drawn over the tyres, so the
+# fenders cover most of each one and only a thin sliver shows past the body edge.
+FRONT_STEER_DEG = -10.0   # small negative steer into the drift; rear tyres stay parallel
+AXLES = (
+    (FRONT_AXLE_X, 13.4, 13.0, 6.0, FRONT_STEER_DEG),
+    (REAR_AXLE_X, 14.8, 15.0, 7.4, 0.0),
+)
+WHEELS = tuple(
+    (x, side * track, length, width, steer)
+    for x, track, length, width, steer in AXLES
+    for side in (-1, 1)
 )
 
-# Tire smoke: overlapping blurred puffs are emitted right behind the rear wheels and
-# between them, so they merge into one bloom hugging the rear. Each puff grows and fades
-# in about 1.25 s (0.104 of the 12 s loop).
-PUFF_PER_WHEEL = 80
-PUFF_CENTER = 56
-PUFF_LIFE = 0.104
-PUFF_R0, PUFF_R1 = 12, 32
+# Tire smoke has three parts, all anchored on the rear axle:
+#  1. a big soft core cloud attached to the car, covering the rear and both flanks;
+#  2. shed puffs that swell and fade where the car has just been, merged by blur;
+#  3. a faint, wide haze that trails further back over the coloured cells.
+CORE_FADE_IN_X = (-60, -15)     # car centre x over which the core cloud fades in
+CORE_FADE_OUT_X = (-10, 55)     # offsets from the canvas width over which it fades out
+PUFF_COUNT = 44
+PUFF_LIFE = 0.10                # loop fraction (1.2 s)
+PUFF_R0, PUFF_R1 = 16, 40
 PUFF_SEED = 12
-SMOKE_BEHIND = 34   # local x of the emission points, just behind the rear tyres
+HAZE_COUNT = 18
+HAZE_LIFE = 0.19
+HAZE_R0, HAZE_R1 = 38, 62
+HAZE_SEED = 7
 
-# Zero-contribution days glow dim as the car passes, so the trail looks packed. Real
-# contribution days keep the bright neon.
-EMPTY_GLOW_COLOR = "#7b3ff2"
-
-# Neon palette for the trail, keyed by GitHub contribution level 1..4.
-NEON_BY_LEVEL = {1: "#7b3ff2", 2: "#c83bdc", 3: "#ff3d9a", 4: "#ff8a1f"}
+# Confetti colours for passed cells (dark theme), picked per cell by a stable hash.
+CONFETTI_DARK = ("#e060a0", "#b060e0", "#8060d0", "#f0b060")   # pink, violet, purple, amber
+CONFETTI_LIGHT = ("#ec88b8", "#c392ee", "#9f8ce2", "#f5c387")  # softer pastels
+# Opacity of a passed cell with no contributions, and the extra it gains per level 1..4.
+EMPTY_ALPHA = 0.85
+LEVEL_ALPHA = {1: 0.9, 2: 0.94, 3: 0.97, 4: 1.0}
+# Saturation and brightness multipliers: empty cells are a little muted, real days pop.
+EMPTY_SAT, EMPTY_VAL = 0.85, 0.94
+LEVEL_SAT = {1: 1.0, 2: 1.08, 3: 1.16, 4: 1.24}
+LEVEL_VAL = {1: 1.0, 2: 1.04, 3: 1.08, 4: 1.12}
 
 THEMES = {
     "dark": {
         "bg": "url(#bgDark)",
-        "base": "#1b1a2c",        # unlit cells: dark charcoal, a bit lighter than the background
+        "base": "#0d0c16",        # cells ahead of the car: near-black
+        "base_stroke": "#201e35",
+        "confetti": CONFETTI_DARK,
         "smoke": "#ffffff",
-        "smoke_peak": 0.5,
-        "empty_color": EMPTY_GLOW_COLOR,
-        "empty_peak": 0.28,
+        "smoke_peak": 0.8,
+        "haze_peak": 0.17,
         "shadow": 0.6,
-        "cone": "#f4fbff",
-        "cone_peak": 0.62,
     },
     "light": {
         "bg": "#f6f7fb",
-        "base": "#e1e4ed",
-        "smoke": "#98a0ba",       # a little darker and bluer than white, so it shows on a light page
-        "smoke_peak": 0.62,
-        "empty_color": "#8a5cf5",
-        "empty_peak": 0.34,
+        "base": "#e4e7f0",
+        "base_stroke": "#d3d7e4",
+        "confetti": CONFETTI_LIGHT,
+        "smoke": "#b0b8d0",       # a little darker and bluer than white, so it shows on a light page
+        "smoke_peak": 0.85,
+        "haze_peak": 0.22,
         "shadow": 0.42,
-        "cone": "#ffd45c",
-        "cone_peak": 0.55,
     },
 }
 
@@ -330,12 +358,45 @@ def trail_cell(col, row, color, peak, width):
             f'fill="{color}" opacity="0">{anim}</rect>')
 
 
-def base_grid(ncols, color):
+def base_grid(ncols, color, stroke):
     out = []
     for col in range(ncols):
         for row in range(ROWS):
-            out.append(cell_rect(col, row, color))
+            out.append(cell_rect(col, row, color, f' stroke="{stroke}" stroke-width="0.7"'))
     return "".join(out)
+
+
+def cell_hash(col, row):
+    """Stable 32-bit mix of (col, row), so colours look scattered and never stripe by column or row."""
+    mask = 0xFFFFFFFF
+    h = (col * 0x9E3779B1 + row * 0x85EBCA6B + 0x27D4EB2F) & mask
+    h ^= h >> 15
+    h = (h * 0x2C1B3C6D) & mask
+    h ^= h >> 12
+    h = (h * 0x297A2D39) & mask
+    h ^= h >> 15
+    return h
+
+
+def tune_color(hex_color, sat, val):
+    r, g, b = (int(hex_color[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    r, g, b = colorsys.hsv_to_rgb(h, min(s * sat, 1.0), min(v * val, 1.0))
+    return "#{:02x}{:02x}{:02x}".format(round(r * 255), round(g * 255), round(b * 255))
+
+
+def passed_cell_style(theme, col, row, level):
+    """(colour, peak opacity) of a cell once the car has passed it.
+
+    The hue is a hash of the position. Empty days are softer; real days are brighter and more
+    saturated, rising gently with contribution level 1..4.
+    """
+    palette = THEMES[theme]["confetti"]
+    base = palette[(cell_hash(col, row) >> 8) % len(palette)]
+    if level <= 0:
+        return tune_color(base, EMPTY_SAT, EMPTY_VAL), EMPTY_ALPHA
+    level = min(level, 4)
+    return tune_color(base, LEVEL_SAT[level], LEVEL_VAL[level]), LEVEL_ALPHA[level]
 
 
 # ---------------------------------------------------------------- car
@@ -361,156 +422,150 @@ def _mirror_path(nose, top_curves):
     return " ".join(d) + " Z"
 
 
-# Mid-engine two-door coupe seen from above, nose to +x. A short sharp nose, front fenders,
-# a tight waist at the doors, wide rear haunches and a short ducktail. Drawn from scratch.
+# Compact mid-engine supercar seen from directly above, nose to +x. Short blunt nose, rounded
+# front fenders, a gentle waist at the doors, wider rear haunches and a short tail.
 BODY_PATH = _mirror_path(
-    (49, 0),
+    (40, 0),
     [
-        ((49.2, -3.0), (47.6, -6.0), (44, -8.4)),          # sharp nose and front corner
-        ((41, -10.2), (36, -14.3), (30, -14.5)),           # front fender flare
-        ((24, -14.6), (19, -11.8), (12, -11.6)),           # fender tapers into the waist
-        ((6, -11.4), (-2, -11.3), (-9, -12.6)),            # doors and the tight waist
-        ((-14, -13.8), (-19, -17.4), (-28, -17.4)),        # rear haunch swells wider than the front
-        ((-33, -17.4), (-37, -17.2), (-40, -16.4)),
-        ((-44.5, -15.6), (-47.6, -14.6), (-48.3, -11.5)),  # short ducktail corner
+        ((40.3, -5.0), (39.6, -9.4), (36.6, -11.8)),       # blunt nose into the front corner
+        ((33.6, -14.0), (29.6, -15.4), (24, -15.6)),       # front fender
+        ((18.5, -15.8), (14, -14.2), (8, -14.2)),          # fender eases into the doors
+        ((2.5, -14.2), (-3.5, -14.4), (-9, -15.4)),        # door line
+        ((-14, -16.4), (-18, -17.2), (-24, -17.2)),        # rear haunch, widest point
+        ((-30, -17.2), (-34.4, -16.6), (-36.4, -14.6)),
+        ((-37.6, -13.2), (-38, -11.8), (-38, -9.5)),       # short, broad tail
     ],
 )
 
-# Glass: a compact cabin set well ahead of the engine bay.
-GLASS_PATH = ("M21,-7.6 C17,-9 10,-9.6 3,-9.4 C-4,-9.2 -9,-8.4 -12,-6.8 L-12,6.8 "
-              "C-9,8.4 -4,9.2 3,9.4 C10,9.6 17,9 21,7.6 C23,3.5 23,-3.5 21,-7.6 Z")
-ROOF_PATH = ("M13,-6 C9,-6.8 4,-7 0,-6.8 C-3,-6.6 -5,-6 -6,-5 L-6,5 C-5,6 -3,6.6 0,6.8 "
-             "C4,7 9,6.8 13,6 C14,3 14,-3 13,-6 Z")
+# Wraparound canopy glass and the lighter roof panel set into it.
+GLASS_PATH = ("M14.5,-6.6 C11.5,-9.2 5.5,-10.8 -2,-10.8 C-9.5,-10.8 -15,-9.4 -18,-6.6 "
+              "C-19.6,-3.4 -19.6,3.4 -18,6.6 C-15,9.4 -9.5,10.8 -2,10.8 C5.5,10.8 11.5,9.2 14.5,6.6 "
+              "C16.2,3.4 16.2,-3.4 14.5,-6.6 Z")
+ROOF_PATH = ("M8.4,-5.2 C5,-6.6 0,-6.8 -4,-6.8 C-8.2,-6.8 -11.2,-6.4 -12.4,-5 "
+             "C-13.2,-2.6 -13.2,2.6 -12.4,5 C-11.2,6.4 -8.2,6.8 -4,6.8 C0,6.8 5,6.6 8.4,5.2 "
+             "C9.6,2.6 9.6,-2.6 8.4,-5.2 Z")
+ROOF_SEAM = "M-2.2,-6.6 C-2.8,-2 -2.8,2 -2.2,6.6"
 
 
-def wheel_art(cx, cy, r):
-    """A tyre with a dished multi-spoke rim and a red brake caliper, drawn at radius 10 and scaled."""
-    spokes = []
-    for k in range(5):
-        a = k * 72
-        spokes.append(
-            f'<g transform="rotate({a})">'
-            '<path d="M0,-1.8 L0,-3.7" stroke="#d9e2f3" stroke-width="2" stroke-linecap="round"/>'
-            '<path d="M0,-3.7 L-2,-5.9 M0,-3.7 L2,-5.9" stroke="#d9e2f3" stroke-width="1.35" '
-            'stroke-linecap="round"/></g>'
-        )
+def wheel_art(cx, cy, length, width, steer):
+    """One tyre tread from above: a dark rounded rectangle with faint ribs and edge sheen."""
+    hl, hw = length / 2, width / 2
+    rx = min(hw, 2.6)
+    ribs = " ".join(f"M{fmt(x)},{fmt(-hw + 0.7)} L{fmt(x)},{fmt(hw - 0.7)}"
+                    for x in (-hl * 0.6, -hl * 0.2, hl * 0.2, hl * 0.6))
+    rot = f" rotate({fmt(steer)})" if steer else ""
     return (
-        f'<g transform="translate({fmt(cx)},{fmt(cy)}) scale({fmt(r / 10)})">'
-        '<circle r="11.9" fill="#02040c" opacity="0.8"/>'                       # shadowed wheel arch
-        '<circle r="10" fill="url(#carTyre)"/>'
-        '<circle r="9.2" fill="none" stroke="#3a4152" stroke-width="0.5"/>'     # sidewall edge
-        '<circle r="7.1" fill="url(#rimGrad)"/>'                                # rim ring
-        '<circle r="6.1" fill="#0a0e19"/>'                                      # dish between spokes
-        '<path d="M-2.6,4.7 A5.4,5.4 0 0 0 3.6,4.1" fill="none" stroke="#ff2e4d" '
-        'stroke-width="1.3" stroke-linecap="round"/>'                           # caliper
-        f'{"".join(spokes)}'
-        '<circle r="2" fill="#eef2fb"/><circle r="0.8" fill="#3b4256"/>'
-        '<path d="M-5.6,-3.6 A6.6,6.6 0 0 1 2.4,-6.2" fill="none" stroke="#ffffff" '
-        'stroke-width="0.8" stroke-linecap="round" opacity="0.7"/>'             # glint on the rim
+        f'<g transform="translate({fmt(cx)},{fmt(cy)}){rot}">'
+        f'<rect x="{fmt(-hl - 0.8)}" y="{fmt(-hw - 0.8)}" width="{fmt(length + 1.6)}" '
+        f'height="{fmt(width + 1.6)}" rx="{fmt(rx + 0.8)}" fill="#000" opacity="0.45" '
+        'filter="url(#softEdge)"/>'
+        f'<rect x="{fmt(-hl)}" y="{fmt(-hw)}" width="{fmt(length)}" height="{fmt(width)}" '
+        f'rx="{fmt(rx)}" fill="url(#carTyre)"/>'
+        f'<path d="{ribs}" stroke="#2a303d" stroke-width="0.7" stroke-linecap="round"/>'
+        f'<rect x="{fmt(-hl + 0.4)}" y="{fmt(-hw + 0.4)}" width="{fmt(length - 0.8)}" '
+        f'height="{fmt(width - 0.8)}" rx="{fmt(max(rx - 0.4, 0.5))}" fill="none" '
+        'stroke="#4a5266" stroke-width="0.5" opacity="0.8"/>'
         '</g>'
     )
 
 
-def deck_slats():
-    """Engine-bay louvres: short light and dark lines across the rear deck."""
+def deck_vents():
+    """Short longitudinal vents on the rear deck: dark slits with a light lower lip."""
     out = []
-    for x in (-20, -23.4, -26.8, -30.2, -33.6, -37):
-        h = 7.4 + (-14 - x) / 27 * 2.2 - 1.3
-        out.append(f'M{fmt(x)},{fmt(-h)} L{fmt(x)},{fmt(h)}')
+    for y in (3.4, 6.4, 9.4):
+        x_end = -22.5 - 11.0 + (y - 3.4) * 0.45
+        for s in (-1, 1):
+            out.append(f"M-22.5,{fmt(s * y)} L{fmt(x_end)},{fmt(s * y)}")
     lines = " ".join(out)
-    return (f'<path d="{lines}" stroke="#02092a" stroke-width="1.1" opacity="0.85"/>'
-            f'<path d="{lines}" transform="translate(-1,0)" stroke="#5b92f0" stroke-width="0.45" '
-            'opacity="0.7"/>')
+    return (f'<path d="{lines}" stroke="#1f3f80" stroke-width="1.1" stroke-linecap="round" opacity="0.85"/>'
+            f'<path d="{lines}" transform="translate(0,0.9)" stroke="#b6d6ff" stroke-width="0.4" '
+            'stroke-linecap="round" opacity="0.55"/>')
 
 
 def car_shapes(theme):
     shadow = THEMES[theme]["shadow"]
-    wheels = "".join(wheel_art(x, y, r) for x, y, r in WHEELS)
+    wheels = "".join(wheel_art(*w) for w in WHEELS)
     return (
         # Drop shadow under the chassis: the outline shifted down-right and blurred.
-        f'<path d="{BODY_PATH}" transform="translate(2.5,4.5)" fill="#000" opacity="{shadow}" '
+        f'<path d="{BODY_PATH}" transform="translate(2,3.8)" fill="#000" opacity="{shadow}" '
         'filter="url(#shadowBlur)"/>'
-        # Paint: sculpted base gradient, a darker underside, and a front-to-rear tonal wash.
+        # Tyres come first so the body and fenders drawn after them cover most of each one.
+        f'{wheels}'
+        # Light-blue metallic paint, a slightly darker lower flank and a gentle nose-to-tail wash.
         f'<path d="{BODY_PATH}" fill="url(#carBody)"/>'
         f'<path d="{BODY_PATH}" fill="url(#carUnder)"/>'
         f'<path d="{BODY_PATH}" fill="url(#carLong)"/>'
-        # Reflections live inside the body outline: a soft sky highlight on each shoulder, a
-        # dark horizon band low on the flank, and a faint neon bounce from the trail below.
         '<g clip-path="url(#bodyClip)">'
-        '<path d="M42,-7.6 C34,-11.6 20,-10.2 6,-10.2" fill="none" stroke="#ffffff" stroke-width="5" '
-        'stroke-linecap="round" opacity="0.26" filter="url(#glow)"/>'
-        '<path d="M-14,-12.6 C-22,-15.4 -34,-15.4 -42,-12" fill="none" stroke="#ffffff" stroke-width="4.4" '
-        'stroke-linecap="round" opacity="0.22" filter="url(#glow)"/>'
-        '<path d="M40,9 C30,12 16,10.4 4,10.4 C-8,10.4 -18,15 -30,15 C-40,14.6 -44,12.6 -46,10.6" '
-        'fill="none" stroke="#020c3a" stroke-width="4" opacity="0.4" filter="url(#glow)"/>'
-        '<path d="M45,6 C39,10.6 35,13.2 30,13.4 C23,13.4 18,10.6 12,10.6 M-12,12 C-18,15.4 -24,16.4 '
-        '-31,16.4 C-37,16.4 -41,15.4 -44,13.4" fill="none" stroke="#ff5db0" stroke-width="1" '
-        'stroke-linecap="round" opacity="0.4" filter="url(#softEdge)"/>'
-        # Lighter centre ridge along the hood and the rear deck.
-        '<path d="M47,-3.2 C38,-4 30,-4.6 21,-4.6 L21,4.6 C30,4.6 38,4 47,3.2 Z" fill="url(#carRidge)"/>'
+        # Rear deck: a darker plate with the vents on it.
+        '<path d="M-19.5,-12.6 C-25,-14 -31,-13.6 -34.6,-11.4 C-36.2,-10 -36.2,10 -34.6,11.4 '
+        'C-31,13.6 -25,14 -19.5,12.6 Z" fill="#3d6fc2" opacity="0.5"/>'
+        f'{deck_vents()}'
+        # Soft sheen on the lower shoulder.
+        '<path d="M30,12.4 C22,13.4 12,12.2 2,12.2 C-8,12.2 -16,14.6 -26,14.4" fill="none" '
+        'stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" opacity="0.18" filter="url(#glow)"/>'
         '</g>'
-        # Outline.
-        f'<path d="{BODY_PATH}" fill="none" stroke="#04113d" stroke-width="0.7"/>'
-        # Panel seams: hood cut lines, cowl, door shut lines.
-        '<path d="M43,-6.4 C36,-8.4 28,-10.2 21.6,-9.6 M43,6.4 C36,8.4 28,10.2 21.6,9.6" fill="none" '
-        'stroke="#041044" stroke-width="0.6" opacity="0.7"/>'
-        '<path d="M12,-11.6 C10.6,-9 10.4,-6 11,-1 M12,11.6 C10.6,9 10.4,6 11,1" fill="none" '
-        'stroke="#041044" stroke-width="0.6" opacity="0.55"/>'
-        # Front splitter slot and nose.
-        '<path d="M48.4,-1.6 L45,-2.8 L45,2.8 L48.4,1.6 Z" fill="#03092a" opacity="0.85"/>'
-        # Side intakes ahead of the rear haunches and the engine-bay deck with louvres.
-        '<path d="M-3,-10.6 C-8,-11 -14,-12.6 -19,-14.6 L-19,-12.4 C-14,-11 -8,-9.4 -3,-9.2 Z '
-        'M-3,10.6 C-8,11 -14,12.6 -19,14.6 L-19,12.4 C-14,11 -8,9.4 -3,9.2 Z" fill="#030b30" opacity="0.85"/>'
-        '<path d="M-14,-7.4 L-41,-9.6 Q-43,-9.6 -43,-7.6 L-43,7.6 Q-43,9.6 -41,9.6 L-14,7.4 Z" '
-        'fill="#06154a" opacity="0.78" stroke="#02092a" stroke-width="0.5"/>'
-        f'{deck_slats()}'
-        # Ducktail lip and its highlight.
-        '<path d="M-43.8,-13.4 C-45,-6 -45,6 -43.8,13.4" fill="none" stroke="#02082a" stroke-width="0.9" opacity="0.8"/>'
-        '<path d="M-45,-13 C-46.2,-6 -46.2,6 -45,13" fill="none" stroke="#9cc4ff" stroke-width="0.5" opacity="0.5"/>'
-        # Wheels sit in shadowed arches at the four corners.
-        f'{wheels}'
-        # Dark windshield and cabin, with a slightly lighter roof panel.
-        f'<path d="{GLASS_PATH}" fill="url(#carGlass)" stroke="#020717" stroke-width="0.6"/>'
-        f'<path d="{ROOF_PATH}" fill="url(#carRoof)"/>'
+        # Outline in a deeper blue.
+        f'<path d="{BODY_PATH}" fill="none" stroke="#2f5fae" stroke-width="0.7" opacity="0.9"/>'
+        # Hood cut lines and door shut lines, kept faint.
+        '<path d="M34,-8.4 C30,-9.4 26,-9.8 22.4,-9.6 M34,8.4 C30,9.4 26,9.8 22.4,9.6" fill="none" '
+        'stroke="#2f5fae" stroke-width="0.5" opacity="0.5"/>'
+        '<path d="M-9,-14.4 C-10,-10 -10.4,-8 -10.4,-6.4 M-9,14.4 C-10,10 -10.4,8 -10.4,6.4" fill="none" '
+        'stroke="#2f5fae" stroke-width="0.5" opacity="0.45"/>'
+        # Small dark intake low on the nose.
+        '<path d="M39,-2.4 C37.6,-3 36.4,-3.4 35.2,-3.4 L35.2,3.4 C36.4,3.4 37.6,3 39,2.4 Z" '
+        'fill="#0f1830" opacity="0.9"/>'
+        # Headlamps: thin white slivers at the front corners.
+        '<path d="M36.4,-9.4 L33.2,-11.8 L32.8,-10.8 L35.6,-8.4 Z M36.4,9.4 L33.2,11.8 L32.8,10.8 L35.6,8.4 Z" '
+        'fill="#ffffff" opacity="0.95"/>'
+        # Dark wraparound canopy with a lighter roof panel, a seam and a faint glare.
+        '<g transform="translate(2,0)">'
+        f'<path d="{GLASS_PATH}" fill="url(#carGlass)" stroke="#0c1220" stroke-width="0.5"/>'
         '<g clip-path="url(#glassClip)">'
-        '<path d="M22,-9 L13,-9 L16.5,9 L23,9 Z" fill="#8ec2ff" opacity="0.22"/>'
-        '<path d="M-6,-9 L-12,-9 L-12,9 L-8,9 Z" fill="#8ec2ff" opacity="0.14"/>'
+        '<path d="M15,-9 L9,-9 L11.4,9 L16.6,9 Z" fill="#8ec2ff" opacity="0.2"/>'
         '</g>'
-        '<path d="M20.6,-6.6 C22.4,-3 22.4,3 20.6,6.6" fill="none" stroke="#a9d6ff" stroke-width="0.7" opacity="0.7"/>'
-        # Mirrors.
-        '<path d="M18,-9.4 L15.2,-12.8 L13.6,-12.3 L15.4,-9 Z M18,9.4 L15.2,12.8 L13.6,12.3 L15.4,9 Z" '
-        'fill="#1d4fc8" stroke="#04113d" stroke-width="0.4"/>'
-        # Crisp specular streaks, a long one along the shoulder and a short one on the haunch,
-        # each with a blurred twin for the softer reflected highlight.
-        '<path d="M44,-8.4 C39,-11.2 35,-13.2 30,-13.2 C23,-13.2 18,-10.4 12,-10.2" fill="none" '
-        'stroke="url(#carSpec)" stroke-width="1.1" stroke-linecap="round"/>'
-        '<path d="M-10,-12.2 C-15,-14.6 -21,-16 -28,-16 C-34,-16 -38,-15.4 -41,-14.2" fill="none" '
-        'stroke="url(#carSpec)" stroke-width="1" stroke-linecap="round" opacity="0.85"/>'
-        '<path d="M40,-9.4 C34,-12.2 28,-11.8 20,-9.2" fill="none" stroke="#ffffff" stroke-width="2.6" '
-        'stroke-linecap="round" opacity="0.3" filter="url(#softEdge)"/>'
-        # Taillights: slim red bars at the rear corners, with a soft glow.
-        '<path d="M-47.4,-5.6 L-47.4,-10.6 L-45.6,-12.8 L-45.2,-11.6 L-46.3,-9.8 L-46.3,-5.6 Z '
-        'M-47.4,5.6 L-47.4,10.6 L-45.6,12.8 L-45.2,11.6 L-46.3,9.8 L-46.3,5.6 Z" fill="#ff2442" '
-        'filter="url(#softEdge)"/>'
-        '<path d="M-47.4,-5.6 L-47.4,-10.6 L-45.6,-12.8 L-45.2,-11.6 L-46.3,-9.8 L-46.3,-5.6 Z '
-        'M-47.4,5.6 L-47.4,10.6 L-45.6,12.8 L-45.2,11.6 L-46.3,9.8 L-46.3,5.6 Z" fill="#ff6a7c"/>'
-        # Headlights: bright slanted lamps with a soft halo.
-        '<path d="M40.4,-9 L45.8,-5.8 L45.4,-4.2 L39.8,-7 Z M40.4,9 L45.8,5.8 L45.4,4.2 L39.8,7 Z" '
-        'fill="#ffffff" opacity="0.9" filter="url(#glow)"/>'
-        '<path d="M40.4,-9 L45.8,-5.8 L45.4,-4.2 L39.8,-7 Z M40.4,9 L45.8,5.8 L45.4,4.2 L39.8,7 Z" '
-        'fill="#ffffff"/>'
+        f'<path d="{ROOF_PATH}" fill="url(#carRoof)" stroke="#5a8fe0" stroke-width="0.4"/>'
+        f'<path d="{ROOF_SEAM}" fill="none" stroke="#4f86d8" stroke-width="0.6" opacity="0.8"/>'
+        '</g>'
+        # Clean white highlight along the upper shoulder, with a soft twin underneath.
+        '<path d="M34.4,-9.6 C32,-11.8 28,-12.8 24,-13 C18,-13.2 14,-11.8 8,-11.8 C2,-11.8 -4,-12 -9,-13 '
+        'C-14,-14 -18,-15 -24,-15" fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" '
+        'opacity="0.45" filter="url(#softEdge)"/>'
+        '<path d="M34.4,-9.6 C32,-11.8 28,-12.8 24,-13 C18,-13.2 14,-11.8 8,-11.8 C2,-11.8 -4,-12 -9,-13 '
+        'C-14,-14 -18,-15 -24,-15" fill="none" stroke="url(#carSpec)" stroke-width="1.3" '
+        'stroke-linecap="round"/>'
     )
 
 
-def light_cone(theme):
-    """Two overlapping tapered beams ahead of the nose, soft at the edges."""
-    return (
-        '<g filter="url(#haze)">'
-        '<path d="M45,-6.4 L142,-30 Q154,-12 148,-2 L45,-3.2 Z" fill="url(#lightCone)"/>'
-        '<path d="M45,6.4 L142,30 Q154,12 148,2 L45,3.2 Z" fill="url(#lightCone)"/>'
-        '<path d="M45,-5 L150,-22 Q164,0 150,22 L45,5 Z" fill="url(#lightCone)" opacity="0.7"/>'
-        '</g>'
+def pass_frac_at_x(x, width):
+    """Loop fraction at which the car centre is at x (linear motion)."""
+    x0, x1 = car_span(width)
+    return PASS_START + (PASS_END - PASS_START) * (x - x0) / (x1 - x0)
+
+
+def smoke_core(width, theme):
+    """A large, soft white cloud attached to the car, billowing from the rear and both flanks.
+
+    Drawn in the car's local frame (under the body), so it follows the car; round lobes make
+    the rotation invisible. It fades in as the car enters and out as it leaves.
+    """
+    peak = THEMES[theme]["smoke_peak"]
+    ax = REAR_AXLE_X
+    # Large merged lobes: a big rear/side bloom, bigger than the body, with a little wrap toward the nose.
+    lobes = ((ax - 10, 0, 50), (ax - 32, 0, 42),
+             (ax + 2, -28, 38), (ax + 2, 28, 38),
+             (ax - 22, -20, 36), (ax - 22, 20, 36),
+             (ax + 20, -26, 30), (ax + 20, 26, 30),
+             (ax + 36, -20, 22), (ax + 36, 20, 22))
+    circles = "".join(
+        f'<circle cx="{fmt(float(x))}" cy="{fmt(float(y))}" r="{fmt(float(r))}" fill="url(#smoke{theme})"/>'
+        for x, y, r in lobes
     )
+    times = [0,
+             pass_frac_at_x(CORE_FADE_IN_X[0], width), pass_frac_at_x(CORE_FADE_IN_X[1], width),
+             pass_frac_at_x(width + CORE_FADE_OUT_X[0], width), pass_frac_at_x(width + CORE_FADE_OUT_X[1], width),
+             1]
+    anim = animate("opacity", [0, 0, peak, peak, 0, 0], times)
+    return f'<g opacity="0">{anim}<g filter="url(#coreBlur)">{circles}</g></g>'
 
 
 def car_layers(width, cy, theme):
@@ -531,7 +586,7 @@ def car_layers(width, cy, theme):
         calc="spline",
         splines=";".join([ease] * 4),
     )
-    return f"<g>{move}<g>{rot}{light_cone(theme)}{car_shapes(theme)}</g></g>"
+    return f"<g>{move}<g>{rot}{smoke_core(width, theme)}{car_shapes(theme)}</g></g>"
 
 
 # ---------------------------------------------------------------- smoke
@@ -546,46 +601,69 @@ def drift_angle_at(frac):
     return DRIFT_DEG * eased
 
 
+def local_to_world(born, lx, ly, width, cy):
+    """World position of a car-local point at loop fraction `born`, following the car's yaw."""
+    ang = math.radians(drift_angle_at(born))
+    return (car_center_at(born, width) + lx * math.cos(ang) - ly * math.sin(ang),
+            cy + lx * math.sin(ang) + ly * math.cos(ang))
+
+
 def smoke_layers(width, cy, theme):
-    """Tire smoke: overlapping blurred puffs born just behind the rear wheels, merged into one bloom."""
+    """Shed smoke: puffs and a wide haze left behind where the car has been, merged by blur.
+
+    The big cloud that rides on the car is drawn by smoke_core(). Both are anchored on the
+    rear axle. Emission only runs while the car is on or near the canvas.
+    """
     palette = THEMES[theme]
+    t_in = pass_frac_at_x(-40, width)
+    t_out = pass_frac_at_x(width + 20, width)
+
     rng = random.Random(PUFF_SEED)
-    # Emit only while the car is on or near the canvas.
-    x0, x1 = car_span(width)
-    t_in = PASS_START + (PASS_END - PASS_START) * ((-30 - x0) / (x1 - x0))
-    t_out = PASS_START + (PASS_END - PASS_START) * ((width + 10 - x0) / (x1 - x0))
-    sources = [(-SMOKE_BEHIND, WHEELS[2][1], PUFF_PER_WHEEL),
-               (-SMOKE_BEHIND, WHEELS[3][1], PUFF_PER_WHEEL),
-               (-SMOKE_BEHIND - 3, 0.0, PUFF_CENTER)]
-    out = []
-    for lx, ly, count in sources:
-        for i in range(count):
-            born = t_in + (t_out - t_in) * (i + rng.uniform(0.0, 1.0)) / count
-            ang = math.radians(drift_angle_at(born))
-            px = lx + rng.uniform(-2.5, 2.5)
-            py = ly + rng.uniform(-5, 5)
-            # Rotate the emission point into the world, following the car's yaw.
-            sx = car_center_at(born, width) + px * math.cos(ang) - py * math.sin(ang)
-            sy = cy + px * math.sin(ang) + py * math.cos(ang)
-            scale = rng.uniform(0.85, 1.2)
-            dx = rng.uniform(-16, -7)       # the cloud is left behind as the car moves on
-            dy = rng.uniform(-6, 6)
-            r0, r1 = PUFF_R0 * scale, PUFF_R1 * scale
-            times = [0, born, born + PUFF_LIFE, 1]
-            anims = (
-                animate("r", [r0, r0, r1, r1], times)
-                + animate("cx", [sx, sx, sx + dx, sx + dx], times)
-                + animate("cy", [sy, sy, sy + dy, sy + dy], times)
-                + animate("opacity", [0, 0, palette["smoke_peak"], palette["smoke_peak"] * 0.55, 0, 0],
-                          [0, born, born + PUFF_LIFE * 0.12, born + PUFF_LIFE * 0.5,
-                           born + PUFF_LIFE, 1])
-            )
-            out.append(
-                f'<circle cx="{fmt(sx)}" cy="{fmt(sy)}" r="{fmt(r0)}" '
-                f'fill="url(#smoke{theme})" opacity="0">{anims}</circle>'
-            )
-    # A light blur on each puff plus a wider blur on the group fuses them into a milky volume.
-    return f'<g filter="url(#smokeWide)"><g filter="url(#smokeSoft)">{"".join(out)}</g></g>'
+    puffs = []
+    for i in range(PUFF_COUNT):
+        born = t_in + (t_out - t_in) * (i + rng.uniform(0.0, 1.0)) / PUFF_COUNT
+        side = rng.choice((-1, 0, 1))                     # left flank, rear centre or right flank
+        lx = REAR_AXLE_X + rng.uniform(-16, 4)
+        ly = side * rng.uniform(6, 22) if side else rng.uniform(-8, 8)
+        sx, sy = local_to_world(born, lx, ly, width, cy)
+        scale = rng.uniform(0.85, 1.2)
+        dx = -rng.uniform(16, 38)                        # left behind as the car moves on
+        dy = side * rng.uniform(2, 10) + rng.uniform(-4, 4)
+        r0, r1 = PUFF_R0 * scale, PUFF_R1 * scale
+        times = [0, born, born + PUFF_LIFE, 1]
+        anims = (
+            animate("r", [r0, r0, r1, r1], times)
+            + animate("cx", [sx, sx, sx + dx, sx + dx], times)
+            + animate("cy", [sy, sy, sy + dy, sy + dy], times)
+            + animate("opacity", [0, 0, palette["smoke_peak"], palette["smoke_peak"] * 0.5, 0, 0],
+                      [0, born, born + PUFF_LIFE * 0.15, born + PUFF_LIFE * 0.55,
+                       born + PUFF_LIFE, 1])
+        )
+        puffs.append(f'<circle cx="{fmt(sx)}" cy="{fmt(sy)}" r="{fmt(r0)}" '
+                     f'fill="url(#smoke{theme})" opacity="0">{anims}</circle>')
+
+    rng = random.Random(HAZE_SEED)
+    haze = []
+    for i in range(HAZE_COUNT):
+        born = t_in + (t_out - t_in) * (i + rng.uniform(0.0, 1.0)) / HAZE_COUNT
+        sx, sy = local_to_world(born, REAR_AXLE_X - 12, rng.uniform(-6, 6), width, cy)
+        scale = rng.uniform(0.9, 1.15)
+        dx = -rng.uniform(55, 100)
+        rx0, rx1 = HAZE_R0 * 1.3 * scale, HAZE_R1 * 1.5 * scale
+        ry0, ry1 = HAZE_R0 * 0.7 * scale, HAZE_R1 * 0.8 * scale
+        times = [0, born, born + HAZE_LIFE, 1]
+        anims = (
+            animate("rx", [rx0, rx0, rx1, rx1], times)
+            + animate("ry", [ry0, ry0, ry1, ry1], times)
+            + animate("cx", [sx, sx, sx + dx, sx + dx], times)
+            + animate("opacity", [0, 0, palette["haze_peak"], palette["haze_peak"] * 0.6, 0, 0],
+                      [0, born, born + HAZE_LIFE * 0.2, born + HAZE_LIFE * 0.6, born + HAZE_LIFE, 1])
+        )
+        haze.append(f'<ellipse cx="{fmt(sx)}" cy="{fmt(sy)}" rx="{fmt(rx0)}" ry="{fmt(ry0)}" '
+                    f'fill="url(#smoke{theme})" opacity="0">{anims}</ellipse>')
+
+    return (f'<g filter="url(#hazeBlur)">{"".join(haze)}</g>'
+            f'<g filter="url(#smokeWide)"><g filter="url(#smokeSoft)">{"".join(puffs)}</g></g>')
 
 
 # ---------------------------------------------------------------- defs and document
@@ -598,46 +676,33 @@ def defs(theme, width, height):
         '<radialGradient id="bgDark" cx="0.5" cy="0.45" r="0.75">'
         '<stop offset="0" stop-color="#1d1a3e"/><stop offset="0.6" stop-color="#0d0b1f"/>'
         '<stop offset="1" stop-color="#07060f"/></radialGradient>'
-        # Paint: bright crown on the lit shoulder, rolling into deep shade on the far flank.
+        # Light-blue metallic paint: a brighter crown on the lit shoulder rolling into a deeper flank.
         '<linearGradient id="carBody" x1="0" y1="0" x2="0" y2="1">'
-        '<stop offset="0" stop-color="#1c4bb8"/><stop offset="0.14" stop-color="#63a6ff"/>'
-        '<stop offset="0.34" stop-color="#4a90fa"/><stop offset="0.5" stop-color="#3373ec"/>'
-        '<stop offset="0.7" stop-color="#2255c8"/><stop offset="0.9" stop-color="#112f86"/>'
-        '<stop offset="1" stop-color="#0a1f66"/></linearGradient>'
-        # Darker underside along the lower flank.
+        '<stop offset="0" stop-color="#9cc6fc"/><stop offset="0.22" stop-color="#78b0f8"/>'
+        '<stop offset="0.6" stop-color="#6098e8"/><stop offset="1" stop-color="#4a82d6"/></linearGradient>'
+        # Slightly darker lower flank.
         '<linearGradient id="carUnder" x1="0" y1="0" x2="0" y2="1">'
-        '<stop offset="0.55" stop-color="#010622" stop-opacity="0"/>'
-        '<stop offset="0.9" stop-color="#010622" stop-opacity="0.5"/>'
-        '<stop offset="1" stop-color="#010622" stop-opacity="0.75"/></linearGradient>'
-        # Tonal wash: a little brighter toward the nose, darker at the tail.
+        '<stop offset="0.6" stop-color="#1c3f8a" stop-opacity="0"/>'
+        '<stop offset="1" stop-color="#1c3f8a" stop-opacity="0.35"/></linearGradient>'
+        # Tonal wash: a touch brighter toward the nose, a touch darker at the tail.
         '<linearGradient id="carLong" x1="0" y1="0" x2="1" y2="0">'
-        '<stop offset="0" stop-color="#000a30" stop-opacity="0.28"/>'
-        '<stop offset="0.45" stop-color="#000a30" stop-opacity="0"/>'
-        '<stop offset="1" stop-color="#bcd8ff" stop-opacity="0.16"/></linearGradient>'
-        '<linearGradient id="carRidge" x1="0" y1="0" x2="0" y2="1">'
-        '<stop offset="0" stop-color="#a8cfff" stop-opacity="0"/>'
-        '<stop offset="0.35" stop-color="#a8cfff" stop-opacity="0.4"/>'
-        '<stop offset="1" stop-color="#a8cfff" stop-opacity="0"/></linearGradient>'
+        '<stop offset="0" stop-color="#1c3f8a" stop-opacity="0.2"/>'
+        '<stop offset="0.5" stop-color="#1c3f8a" stop-opacity="0"/>'
+        '<stop offset="1" stop-color="#d4e6ff" stop-opacity="0.14"/></linearGradient>'
         '<linearGradient id="carSpec" x1="0" y1="0" x2="1" y2="0">'
-        '<stop offset="0" stop-color="#ffffff" stop-opacity="0.15"/>'
+        '<stop offset="0" stop-color="#ffffff" stop-opacity="0.5"/>'
         '<stop offset="0.5" stop-color="#ffffff" stop-opacity="1"/>'
-        '<stop offset="1" stop-color="#ffffff" stop-opacity="0.2"/></linearGradient>'
+        '<stop offset="1" stop-color="#ffffff" stop-opacity="0.45"/></linearGradient>'
         '<linearGradient id="carGlass" x1="0" y1="0" x2="1" y2="1">'
-        '<stop offset="0" stop-color="#16316c"/><stop offset="0.5" stop-color="#050f28"/>'
-        '<stop offset="1" stop-color="#010309"/></linearGradient>'
+        '<stop offset="0" stop-color="#2a3346"/><stop offset="0.55" stop-color="#171d2b"/>'
+        '<stop offset="1" stop-color="#0d111b"/></linearGradient>'
         '<linearGradient id="carRoof" x1="0" y1="0" x2="0" y2="1">'
-        '<stop offset="0" stop-color="#2a5cc4"/><stop offset="1" stop-color="#0b2060"/></linearGradient>'
-        '<radialGradient id="carTyre" cx="0.5" cy="0.5" r="0.5">'
-        '<stop offset="0.6" stop-color="#05060a"/><stop offset="1" stop-color="#1c202b"/></radialGradient>'
-        '<linearGradient id="rimGrad" x1="0" y1="0" x2="1" y2="1">'
-        '<stop offset="0" stop-color="#f4f7ff"/><stop offset="0.5" stop-color="#8f9bb5"/>'
-        '<stop offset="1" stop-color="#4a5368"/></linearGradient>'
+        '<stop offset="0" stop-color="#a6cdfd"/><stop offset="1" stop-color="#7db3f6"/></linearGradient>'
+        '<linearGradient id="carTyre" x1="0" y1="0" x2="0" y2="1">'
+        '<stop offset="0" stop-color="#232733"/><stop offset="0.3" stop-color="#07080d"/>'
+        '<stop offset="0.7" stop-color="#07080d"/><stop offset="1" stop-color="#232733"/></linearGradient>'
         f'<clipPath id="bodyClip"><path d="{BODY_PATH}"/></clipPath>'
         f'<clipPath id="glassClip"><path d="{GLASS_PATH}"/></clipPath>'
-        '<linearGradient id="lightCone" x1="0" y1="0" x2="1" y2="0">'
-        f'<stop offset="0" stop-color="{palette["cone"]}" stop-opacity="{palette["cone_peak"]}"/>'
-        f'<stop offset="0.5" stop-color="{palette["cone"]}" stop-opacity="{fmt(palette["cone_peak"] * 0.4)}"/>'
-        f'<stop offset="1" stop-color="{palette["cone"]}" stop-opacity="0"/></linearGradient>'
         # Smoke puff: dense milky core with a long soft falloff so neighbours merge.
         f'<radialGradient id="smoke{theme}" cx="0.5" cy="0.5" r="0.5">'
         f'<stop offset="0" stop-color="{smoke}" stop-opacity="1"/>'
@@ -650,13 +715,17 @@ def defs(theme, width, height):
         '<feGaussianBlur stdDeviation="1.8"/></filter>'
         '<filter id="shadowBlur" x="-30%" y="-50%" width="160%" height="200%">'
         '<feGaussianBlur stdDeviation="2.4"/></filter>'
-        '<filter id="haze" x="-10%" y="-60%" width="150%" height="220%">'
-        '<feGaussianBlur stdDeviation="5"/></filter>'
         # Smoke filters cover the whole canvas, so animated puffs never clip.
         f'<filter id="smokeSoft" filterUnits="userSpaceOnUse" x="-120" y="0" width="{width + 240}" height="{height}">'
-        '<feGaussianBlur stdDeviation="3.5"/></filter>'
-        f'<filter id="smokeWide" filterUnits="userSpaceOnUse" x="-120" y="0" width="{width + 240}" height="{height}">'
         '<feGaussianBlur stdDeviation="5"/></filter>'
+        f'<filter id="smokeWide" filterUnits="userSpaceOnUse" x="-120" y="0" width="{width + 240}" height="{height}">'
+        '<feGaussianBlur stdDeviation="6"/></filter>'
+        f'<filter id="hazeBlur" filterUnits="userSpaceOnUse" x="-120" y="0" width="{width + 240}" height="{height}">'
+        '<feGaussianBlur stdDeviation="11"/></filter>'
+        # The core cloud lives in the car's local frame.
+        # objectBoundingBox so the region follows the car; generous padding so the blur never clips.
+        '<filter id="coreBlur" x="-80%" y="-80%" width="260%" height="260%">'
+        '<feGaussianBlur stdDeviation="9"/></filter>'
         "</defs>"
     )
 
@@ -681,17 +750,15 @@ def render(days, theme):
     width, height = canvas_size(ncols)
     cy = car_center_y()
 
-    base = base_grid(ncols, palette["base"])
+    base = base_grid(ncols, palette["base"], palette["base_stroke"])
     trail = []
     for col in range(ncols):
         for row in range(ROWS):
             day = grid.get((col, row))
-            if day is not None and day.is_lit():
-                color = NEON_BY_LEVEL[min(max(day.level, 1), 4)]
-                trail.append(trail_cell(col, row, color, 1.0, width))
-            else:
-                # Days without contributions never get bright neon. They glow dim behind the car.
-                trail.append(trail_cell(col, row, palette["empty_color"], palette["empty_peak"], width))
+            # Every passed cell fills, including days with no contributions.
+            level = 0 if day is None or not day.is_lit() else max(day.level, 1)
+            color, peak = passed_cell_style(theme, col, row, level)
+            trail.append(trail_cell(col, row, color, peak, width))
 
     layers = (
         base
@@ -699,10 +766,28 @@ def render(days, theme):
         + smoke_layers(width, cy, theme)
         + car_layers(width, cy, theme)
     )
-    desc = ("A blue sports car drives across a contribution graph. Each day with contributions "
-            "lights up in neon as the car passes, empty days glow faintly, and the rear tires "
-            "throw a cloud of smoke.")
+    desc = ("A light-blue sports car drifts across a contribution graph. Cells ahead of it stay dark. "
+            "Every cell it passes fills with scattered purple, violet, pink and amber, brighter on "
+            "days with contributions and softer on empty days, while the rear tires throw a large "
+            "cloud of white smoke.")
     return svg_document(width, height, theme, "Car contribution animation", desc, layers)
+
+
+# ---------------------------------------------------------------- car preview
+
+def car_preview_svg(theme, zoom=4):
+    """Standalone, static SVG of just the car at 0 degrees and at the mid-drift angle."""
+    w, h = 300, 150
+    cars = "".join(
+        f'<g transform="translate({fmt(cx)},{fmt(h / 2)}) rotate({fmt(ang)})">{car_shapes(theme)}</g>'
+        for cx, ang in ((75, 0.0), (205, DRIFT_DEG))
+    )
+    bg = THEMES[theme]["bg"]
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w * zoom}" height="{h * zoom}" '
+        f'viewBox="0 0 {w} {h}">'
+        f'{defs(theme, w, h)}<rect width="{w}" height="{h}" fill="{bg}"/>{cars}</svg>\n'
+    )
 
 
 # ---------------------------------------------------------------- CLI
@@ -711,7 +796,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--user", default="RamSuryaCH")
     parser.add_argument("--outdir", default="dist")
+    parser.add_argument("--dump-car", metavar="PATH",
+                        help="write a standalone 4x SVG of just the car (0 deg and mid-drift) "
+                             "to PATH and exit; no network access")
+    parser.add_argument("--theme", choices=("dark", "light"), default="dark",
+                        help="theme used by --dump-car")
     args = parser.parse_args(argv)
+
+    if args.dump_car:
+        svg = car_preview_svg(args.theme)
+        ET.fromstring(svg)
+        Path(args.dump_car).write_text(svg, encoding="utf-8")
+        print(f"wrote {args.dump_car}")
+        return 0
 
     days = fetch_days(args.user)
     outputs = {}
