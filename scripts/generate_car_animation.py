@@ -9,13 +9,14 @@ Writes two files into --outdir:
   car-animation-light.svg
 
 A top-down sports car drives once, left to right, across the user's real public
-contribution calendar (the last 53 weeks, Sunday on top), coloured with GitHub's own
-contribution-level palette. Data comes from the GraphQL contributionCalendar API when a
-token is available (GITHUB_TOKEN, GH_TOKEN, or `gh auth token`), otherwise from the public
-contributions page. Empty days stay at level 0. The car may briefly brighten each cell as
-it passes; once it has gone, every cell shows its true level, so the settled frame is the
-real graph. The car throws one large, soft white tire-smoke cloud from its rear and sides,
-plus a faint wide haze that trails behind it.
+contribution calendar (the last 53 weeks, Sunday on top). Every real day starts as a dark
+empty outline. As the car passes each column, that column's cells pop in with a short
+scale-and-fade reveal and keep their colour until the loop restarts. Each day's colour is
+its contribution level (0..4) on a neon palette, violet through purple and pink to amber.
+Data comes from the GraphQL contributionCalendar API when a token is available
+(GITHUB_TOKEN, GH_TOKEN, or `gh auth token`), otherwise from the public contributions page.
+The two rear tyres shed small, soft puffs of tyre smoke while the car drifts. The puffs stay
+where they were emitted.
 
 Standard library only. Output is deterministic for the same input data.
 """
@@ -52,10 +53,8 @@ CELL_RX = 2.5
 LOOP_SECONDS = 12
 PASS_START = 0.04   # loop fraction when the car starts moving on screen
 PASS_END = 0.80     # loop fraction when the car has left the right edge
-FILL_LEN = 0.025    # loop fraction over which one cell lights up (about 0.3 s)
+POP_LEN = 0.02      # loop fraction for one cell's pop-in (about 0.24 s)
 ROW_STAGGER = 0.0012  # tiny per-row delay so the wave looks organic, not a hard column
-TRAIL_HOLD = 0.90   # the finished trail stays lit until this fraction, then fades
-TRAIL_FADE_END = 0.985
 DRIFT_DEG = -24.0   # negative = nose up-right during the middle of the drift
 
 # Car center travels from fully off the left edge to fully off the right edge.
@@ -85,45 +84,46 @@ WHEELS = tuple(
     for side in (-1, 1)
 )
 
-# Tire smoke has three parts, all anchored on the rear axle:
-#  1. a big soft core cloud attached to the car, covering the rear and both flanks;
-#  2. shed puffs that swell and fade where the car has just been, merged by blur;
-#  3. a faint, wide haze that trails further back over the coloured cells.
-CORE_FADE_IN_X = (-60, -15)     # car centre x over which the core cloud fades in
-CORE_FADE_OUT_X = (-10, 55)     # offsets from the canvas width over which it fades out
-PUFF_COUNT = 44
-PUFF_LIFE = 0.10                # loop fraction (1.2 s)
-PUFF_R0, PUFF_R1 = 16, 40
+REAR_TRACK_Y = AXLES[1][1]  # half track of the rear tyres, |y| in car-local units
+# Tyre smoke: small puffs shed by the two rear tyres only, while the car is drifting on the
+# canvas. Each puff is born at a rear wheel in world space and then stays put.
+SMOKE_EMIT_EVERY = 0.12   # seconds between puff emissions from each rear tyre
+PUFF_LIFE = 0.075         # loop fraction (0.9 s) from birth to fully faded
+PUFF_R0 = (6.0, 8.0)      # start radius range, about one tyre wide
+PUFF_GROW = (1.15, 1.3)   # end radius = start radius times this factor
+PUFF_DRIFT_BACK = (3.0, 7.0)   # how far a puff slides rearward over its life, local units
+PUFF_DRIFT_OUT = (1.0, 3.0)    # outward slide, away from the car centre line
+PUFF_EDGE_JITTER = 1.5    # random offset from the tyre centre
 PUFF_SEED = 12
-HAZE_COUNT = 18
-HAZE_LIFE = 0.19
-HAZE_R0, HAZE_R1 = 38, 62
-HAZE_SEED = 7
+# Puff opacity: fade in briefly, peak, then drop to a faint tail and to zero at PUFF_LIFE.
+PUFF_RISE = 0.08          # fraction of PUFF_LIFE spent fading in
+PUFF_TAIL_AT = 0.35       # fraction of PUFF_LIFE where the opacity has fallen to PUFF_TAIL
+PUFF_TAIL = 0.35          # share of peak opacity left at PUFF_TAIL_AT
 
-# Official GitHub contribution-level colours, index 0..4.
-LEVEL_DARK = ("#161b22", "#0e4429", "#006d32", "#26a641", "#39d353")
-LEVEL_LIGHT = ("#ebedf0", "#9be9a8", "#40c463", "#30a14e", "#216e39")
-# Brief pass glow: a lighter overlay on each real cell, then it returns to its true level.
-GLOW_PEAK_EMPTY = 0.28
-GLOW_PEAK_LIT = 0.62
-GLOW_RISE = 0.012    # loop fraction to reach the glow peak (~0.14 s)
-GLOW_FALL = 0.040    # loop fraction back to the true colour (~0.48 s)
+# Official contribution-level colours are not used. Index 0..4 is the neon palette: violet,
+# purple, pink, then amber for the busiest days. Level 0 is a dim violet tint, so the trail
+# reads as continuous neon.
+LEVEL_NEON_DARK = ("#4a2a78", "#7b3ff2", "#b060e0", "#ff3d9a", "#ff8a1f")
+LEVEL_NEON_LIGHT = ("#d9c8f5", "#b48cf2", "#d49ae8", "#f58cc0", "#ffb366")
+# Empty day outlines. Dark is a near-black fill with a faint violet outline. Light is a light grey outline.
+EMPTY_DARK = ("#0b0a18", "#2b2750")
+EMPTY_LIGHT = ("none", "#d3d7e0")
 
 THEMES = {
     "dark": {
         "bg": "url(#bgDark)",
-        "levels": LEVEL_DARK,
+        "levels": LEVEL_NEON_DARK,
+        "empty": EMPTY_DARK,
         "smoke": "#ffffff",
-        "smoke_peak": 0.8,
-        "haze_peak": 0.17,
+        "smoke_peak": 0.35,
         "shadow": 0.6,
     },
     "light": {
         "bg": "#f6f7fb",
-        "levels": LEVEL_LIGHT,
-        "smoke": "#b0b8d0",       # a little darker and bluer than white, so it shows on a light page
-        "smoke_peak": 0.85,
-        "haze_peak": 0.22,
+        "levels": LEVEL_NEON_LIGHT,
+        "empty": EMPTY_LIGHT,
+        "smoke": "#9aa2b6",       # a darker grey than the dark-theme white, so it shows on a light page
+        "smoke_peak": 0.4,
         "shadow": 0.42,
     },
 }
@@ -360,20 +360,6 @@ def animate_transform(kind, values, times, calc="linear", splines=None):
             f'repeatCount="indefinite" calcMode="{calc}"{extra}/>')
 
 
-def cell_rect(col, row, fill, extra=""):
-    return (f'<rect x="{fmt(float(cell_x(col)))}" y="{fmt(float(cell_y(row)))}" '
-            f'width="{CELL}" height="{CELL}" rx="{fmt(CELL_RX)}" fill="{fill}"{extra}/>')
-
-
-def mix_white(hex_color, amount):
-    """Move a hex colour toward white by `amount` (0..1), for the brief pass glow."""
-    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
-    r = round(r + (255 - r) * amount)
-    g = round(g + (255 - g) * amount)
-    b = round(b + (255 - b) * amount)
-    return "#{:02x}{:02x}{:02x}".format(r, g, b)
-
-
 def cell_level(day):
     if day is None:
         return None
@@ -384,50 +370,56 @@ def cell_level(day):
     return min(max(day.level, 0), 4)
 
 
-def real_grid(grid, theme):
-    """One rect per real calendar day, filled with GitHub's colour for that day's level.
+def real_cells(grid):
+    """Every real calendar day with its (col, row) and level. Missing days are never invented."""
+    out = []
+    for (col, row), day in sorted(grid.items()):
+        level = cell_level(day)
+        if level is not None:
+            out.append((col, row, level))
+    return out
 
-    Days that do not exist (for example future weekdays in the current week) are omitted,
-    so the grid never invents a cell.
+
+def empty_grid(grid, theme):
+    """Every real day as a dark, empty rounded outline. This is the start state of the loop."""
+    fill, stroke = THEMES[theme]["empty"]
+    inset = 0.4
+    out = []
+    for col, row, _ in real_cells(grid):
+        out.append(
+            f'<rect x="{fmt(cell_x(col) + inset)}" y="{fmt(cell_y(row) + inset)}" '
+            f'width="{fmt(CELL - 2 * inset)}" height="{fmt(CELL - 2 * inset)}" '
+            f'rx="{fmt(CELL_RX - inset)}" fill="{fill}" stroke="{stroke}" stroke-width="0.8"/>'
+        )
+    return "".join(out)
+
+
+def neon_reveal(grid, theme, width):
+    """Neon fill for each real day, revealed as the car's nose reaches its column.
+
+    Each fill rect is centred on its cell. The outer group is placed at the cell centre, and
+    the inner group scales from 0.2 to 1.15 and back to 1 about that centre while the outer
+    group fades from 0 to 1. After the pop, the cell keeps its true colour until the loop ends.
     """
     colors = THEMES[theme]["levels"]
     out = []
-    for (col, row), day in sorted(grid.items()):
-        level = cell_level(day)
-        if level is None:
-            continue
-        out.append(cell_rect(col, row, colors[level]))
+    for col, row, level in real_cells(grid):
+        t0 = fill_time(col, row, width)
+        t1 = t0 + POP_LEN
+        cx = fmt(cell_x(col) + CELL / 2)
+        cy_ = fmt(cell_y(row) + CELL / 2)
+        half = fmt(-CELL / 2)
+        opacity = animate("opacity", [0, 0, 1, 1], [0, t0, t1, 1])
+        scale = animate_transform("scale", ["0.2", "0.2", "1.15", "1", "1"],
+                                  [0, t0, t0 + POP_LEN / 2, t1, 1])
+        out.append(
+            f'<g transform="translate({cx},{cy_})" opacity="0">{opacity}'
+            f'<g>{scale}'
+            f'<rect x="{half}" y="{half}" width="{CELL}" height="{CELL}" rx="{fmt(CELL_RX)}" '
+            f'fill="{colors[level]}"/></g></g>'
+        )
     return "".join(out)
 
-
-def glow_cell(col, row, color, peak, width):
-    """A short brightness pulse as the car passes, then back to fully transparent."""
-    t0 = fill_time(col, row, width)
-    t1 = min(t0 + GLOW_RISE, 0.98)
-    t2 = min(t0 + GLOW_RISE + GLOW_FALL, 0.995)
-    if t1 <= t0:
-        t1 = min(t0 + 0.001, 0.99)
-    if t2 <= t1:
-        t2 = min(t1 + 0.001, 0.999)
-    times = [0, t0, t1, t2, 1]
-    anim = animate("opacity", [0, 0, peak, 0, 0], times)
-    x = fmt(float(cell_x(col)))
-    y = fmt(float(cell_y(row)))
-    return (f'<rect x="{x}" y="{y}" width="{CELL}" height="{CELL}" rx="{fmt(CELL_RX)}" '
-            f'fill="{color}" opacity="0">{anim}</rect>')
-
-
-def glow_overlay(grid, theme, width):
-    """Brief lighter overlay on each real cell as the car reaches it."""
-    colors = THEMES[theme]["levels"]
-    out = []
-    for (col, row), day in sorted(grid.items()):
-        level = cell_level(day)
-        if level is None:
-            continue
-        peak = GLOW_PEAK_EMPTY if level == 0 else GLOW_PEAK_LIT
-        out.append(glow_cell(col, row, mix_white(colors[level], 0.55), peak, width))
-    return "".join(out)
 
 
 # ---------------------------------------------------------------- car
@@ -573,32 +565,6 @@ def pass_frac_at_x(x, width):
     return PASS_START + (PASS_END - PASS_START) * (x - x0) / (x1 - x0)
 
 
-def smoke_core(width, theme):
-    """A large, soft white cloud attached to the car, billowing from the rear and both flanks.
-
-    Drawn in the car's local frame (under the body), so it follows the car; round lobes make
-    the rotation invisible. It fades in as the car enters and out as it leaves.
-    """
-    peak = THEMES[theme]["smoke_peak"]
-    ax = REAR_AXLE_X
-    # Large merged lobes: a big rear/side bloom, bigger than the body, with a little wrap toward the nose.
-    lobes = ((ax - 10, 0, 50), (ax - 32, 0, 42),
-             (ax + 2, -28, 38), (ax + 2, 28, 38),
-             (ax - 22, -20, 36), (ax - 22, 20, 36),
-             (ax + 20, -26, 30), (ax + 20, 26, 30),
-             (ax + 36, -20, 22), (ax + 36, 20, 22))
-    circles = "".join(
-        f'<circle cx="{fmt(float(x))}" cy="{fmt(float(y))}" r="{fmt(float(r))}" fill="url(#smoke{theme})"/>'
-        for x, y, r in lobes
-    )
-    times = [0,
-             pass_frac_at_x(CORE_FADE_IN_X[0], width), pass_frac_at_x(CORE_FADE_IN_X[1], width),
-             pass_frac_at_x(width + CORE_FADE_OUT_X[0], width), pass_frac_at_x(width + CORE_FADE_OUT_X[1], width),
-             1]
-    anim = animate("opacity", [0, 0, peak, peak, 0, 0], times)
-    return f'<g opacity="0">{anim}<g filter="url(#coreBlur)">{circles}</g></g>'
-
-
 def car_layers(width, cy, theme):
     """One left-to-right drift pass. The car's center moves linearly; the body rotates."""
     x0, x1 = car_span(width)
@@ -617,7 +583,7 @@ def car_layers(width, cy, theme):
         calc="spline",
         splines=";".join([ease] * 4),
     )
-    return f"<g>{move}<g>{rot}{smoke_core(width, theme)}{car_shapes(theme)}</g></g>"
+    return f"<g>{move}<g>{rot}{car_shapes(theme)}</g></g>"
 
 
 # ---------------------------------------------------------------- smoke
@@ -639,62 +605,72 @@ def local_to_world(born, lx, ly, width, cy):
             cy + lx * math.sin(ang) + ly * math.cos(ang))
 
 
-def smoke_layers(width, cy, theme):
-    """Shed smoke: puffs and a wide haze left behind where the car has been, merged by blur.
+def _smoothstep_inverse(value):
+    """The u in [0, 0.5] where smoothstep(u) equals `value` (smoothstep is 3u^2 - 2u^3)."""
+    lo, hi = 0.0, 0.5
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if mid * mid * (3 - 2 * mid) < value:
+            lo = mid
+        else:
+            hi = mid
+    return hi
 
-    The big cloud that rides on the car is drawn by smoke_core(). Both are anchored on the
-    rear axle. Emission only runs while the car is on or near the canvas.
+
+def smoke_layers(width, cy, theme):
+    """Tyre smoke: small puffs shed by the two rear tyres while the car drifts on the canvas.
+
+    Each puff is born at its tyre's world position (local_to_world, using the drift angle at
+    birth) and then stays in world space. It only gets a small outward and rearward slide, so
+    it does not ride along with the car. Puffs fade in briefly, peak at PUFF_LIFE's start, and
+    fall to zero within PUFF_LIFE. A light blur feathers the edges.
     """
     palette = THEMES[theme]
-    t_in = pass_frac_at_x(-40, width)
-    t_out = pass_frac_at_x(width + 20, width)
+    peak = palette["smoke_peak"]
+    # Emit only while the rear tyres are on the canvas and the drift angle is at least a
+    # quarter of its maximum, so the smoke starts and stops with the drift.
+    u_min = _smoothstep_inverse(0.25)
+    mid = PASS_START + (PASS_END - PASS_START) / 2
+    t_drift_a = PASS_START + u_min * (mid - PASS_START)
+    t_drift_b = PASS_END - u_min * (PASS_END - mid)
+    t_lo = max(t_drift_a, pass_frac_at_x(0, width))
+    t_hi = min(t_drift_b, pass_frac_at_x(width, width))
 
+    step = SMOKE_EMIT_EVERY / LOOP_SECONDS
     rng = random.Random(PUFF_SEED)
     puffs = []
-    for i in range(PUFF_COUNT):
-        born = t_in + (t_out - t_in) * (i + rng.uniform(0.0, 1.0)) / PUFF_COUNT
-        side = rng.choice((-1, 0, 1))                     # left flank, rear centre or right flank
-        lx = REAR_AXLE_X + rng.uniform(-16, 4)
-        ly = side * rng.uniform(6, 22) if side else rng.uniform(-8, 8)
-        sx, sy = local_to_world(born, lx, ly, width, cy)
-        scale = rng.uniform(0.85, 1.2)
-        dx = -rng.uniform(16, 38)                        # left behind as the car moves on
-        dy = side * rng.uniform(2, 10) + rng.uniform(-4, 4)
-        r0, r1 = PUFF_R0 * scale, PUFF_R1 * scale
-        times = [0, born, born + PUFF_LIFE, 1]
-        anims = (
-            animate("r", [r0, r0, r1, r1], times)
-            + animate("cx", [sx, sx, sx + dx, sx + dx], times)
-            + animate("cy", [sy, sy, sy + dy, sy + dy], times)
-            + animate("opacity", [0, 0, palette["smoke_peak"], palette["smoke_peak"] * 0.5, 0, 0],
-                      [0, born, born + PUFF_LIFE * 0.15, born + PUFF_LIFE * 0.55,
-                       born + PUFF_LIFE, 1])
-        )
-        puffs.append(f'<circle cx="{fmt(sx)}" cy="{fmt(sy)}" r="{fmt(r0)}" '
-                     f'fill="url(#smoke{theme})" opacity="0">{anims}</circle>')
+    k = 0
+    while True:
+        slot = t_lo + k * step
+        if slot >= t_hi:
+            break
+        born = slot + rng.uniform(0.0, step)
+        k += 1
+        if born >= t_hi:
+            continue
+        for side in (-1, 1):                              # left and right rear tyre
+            lx = REAR_AXLE_X + rng.uniform(-PUFF_EDGE_JITTER, PUFF_EDGE_JITTER)
+            ly = side * REAR_TRACK_Y + rng.uniform(-PUFF_EDGE_JITTER, PUFF_EDGE_JITTER)
+            sx, sy = local_to_world(born, lx, ly, width, cy)
+            r0 = rng.uniform(*PUFF_R0)
+            r1 = r0 * rng.uniform(*PUFF_GROW)
+            dx = -rng.uniform(*PUFF_DRIFT_BACK)
+            dy = side * rng.uniform(*PUFF_DRIFT_OUT)
+            end = born + PUFF_LIFE
+            times = [0, born, end, 1]
+            anims = (
+                animate("r", [r0, r0, r1, r1], times)
+                + animate("cx", [sx, sx, sx + dx, sx + dx], times)
+                + animate("cy", [sy, sy, sy + dy, sy + dy], times)
+                + animate("opacity",
+                          [0, 0, peak, peak * PUFF_TAIL, 0, 0],
+                          [0, born, born + PUFF_LIFE * PUFF_RISE,
+                           born + PUFF_LIFE * PUFF_TAIL_AT, end, 1])
+            )
+            puffs.append(f'<circle cx="{fmt(sx)}" cy="{fmt(sy)}" r="{fmt(r0)}" '
+                         f'fill="url(#smoke{theme})" opacity="0">{anims}</circle>')
 
-    rng = random.Random(HAZE_SEED)
-    haze = []
-    for i in range(HAZE_COUNT):
-        born = t_in + (t_out - t_in) * (i + rng.uniform(0.0, 1.0)) / HAZE_COUNT
-        sx, sy = local_to_world(born, REAR_AXLE_X - 12, rng.uniform(-6, 6), width, cy)
-        scale = rng.uniform(0.9, 1.15)
-        dx = -rng.uniform(55, 100)
-        rx0, rx1 = HAZE_R0 * 1.3 * scale, HAZE_R1 * 1.5 * scale
-        ry0, ry1 = HAZE_R0 * 0.7 * scale, HAZE_R1 * 0.8 * scale
-        times = [0, born, born + HAZE_LIFE, 1]
-        anims = (
-            animate("rx", [rx0, rx0, rx1, rx1], times)
-            + animate("ry", [ry0, ry0, ry1, ry1], times)
-            + animate("cx", [sx, sx, sx + dx, sx + dx], times)
-            + animate("opacity", [0, 0, palette["haze_peak"], palette["haze_peak"] * 0.6, 0, 0],
-                      [0, born, born + HAZE_LIFE * 0.2, born + HAZE_LIFE * 0.6, born + HAZE_LIFE, 1])
-        )
-        haze.append(f'<ellipse cx="{fmt(sx)}" cy="{fmt(sy)}" rx="{fmt(rx0)}" ry="{fmt(ry0)}" '
-                    f'fill="url(#smoke{theme})" opacity="0">{anims}</ellipse>')
-
-    return (f'<g filter="url(#hazeBlur)">{"".join(haze)}</g>'
-            f'<g filter="url(#smokeWide)"><g filter="url(#smokeSoft)">{"".join(puffs)}</g></g>')
+    return f'<g filter="url(#smokeSoft)">{"".join(puffs)}</g>'
 
 
 # ---------------------------------------------------------------- defs and document
@@ -734,11 +710,11 @@ def defs(theme, width, height):
         '<stop offset="0.7" stop-color="#07080d"/><stop offset="1" stop-color="#232733"/></linearGradient>'
         f'<clipPath id="bodyClip"><path d="{BODY_PATH}"/></clipPath>'
         f'<clipPath id="glassClip"><path d="{GLASS_PATH}"/></clipPath>'
-        # Smoke puff: dense milky core with a long soft falloff so neighbours merge.
+        # Tyre-smoke puff: a soft centre with a feathered falloff. Element opacity sets the strength.
         f'<radialGradient id="smoke{theme}" cx="0.5" cy="0.5" r="0.5">'
         f'<stop offset="0" stop-color="{smoke}" stop-opacity="1"/>'
-        f'<stop offset="0.5" stop-color="{smoke}" stop-opacity="0.9"/>'
-        f'<stop offset="0.75" stop-color="{smoke}" stop-opacity="0.35"/>'
+        f'<stop offset="0.45" stop-color="{smoke}" stop-opacity="0.75"/>'
+        f'<stop offset="0.8" stop-color="{smoke}" stop-opacity="0.25"/>'
         f'<stop offset="1" stop-color="{smoke}" stop-opacity="0"/></radialGradient>'
         '<filter id="softEdge" x="-20%" y="-50%" width="140%" height="200%">'
         '<feGaussianBlur stdDeviation="0.8"/></filter>'
@@ -746,17 +722,9 @@ def defs(theme, width, height):
         '<feGaussianBlur stdDeviation="1.8"/></filter>'
         '<filter id="shadowBlur" x="-30%" y="-50%" width="160%" height="200%">'
         '<feGaussianBlur stdDeviation="2.4"/></filter>'
-        # Smoke filters cover the whole canvas, so animated puffs never clip.
+        # Smoke puffs live in world space. The filter covers the whole canvas, so nothing clips.
         f'<filter id="smokeSoft" filterUnits="userSpaceOnUse" x="-120" y="0" width="{width + 240}" height="{height}">'
-        '<feGaussianBlur stdDeviation="5"/></filter>'
-        f'<filter id="smokeWide" filterUnits="userSpaceOnUse" x="-120" y="0" width="{width + 240}" height="{height}">'
-        '<feGaussianBlur stdDeviation="6"/></filter>'
-        f'<filter id="hazeBlur" filterUnits="userSpaceOnUse" x="-120" y="0" width="{width + 240}" height="{height}">'
-        '<feGaussianBlur stdDeviation="11"/></filter>'
-        # The core cloud lives in the car's local frame.
-        # objectBoundingBox so the region follows the car; generous padding so the blur never clips.
-        '<filter id="coreBlur" x="-80%" y="-80%" width="260%" height="260%">'
-        '<feGaussianBlur stdDeviation="9"/></filter>'
+        '<feGaussianBlur stdDeviation="2"/></filter>'
         "</defs>"
     )
 
@@ -781,18 +749,15 @@ def render(days, theme):
     width, height = canvas_size(ncols)
     cy = car_center_y()
 
-    cells = real_grid(grid, theme)
-    glow = glow_overlay(grid, theme, width)
-
     layers = (
-        cells
-        + glow
+        empty_grid(grid, theme)
+        + neon_reveal(grid, theme, width)
         + smoke_layers(width, cy, theme)
         + car_layers(width, cy, theme)
     )
-    desc = ("A light-blue sports car drifts across the real GitHub contribution graph. Each day "
-            "keeps its true contribution level, briefly brightening as the car passes, and the "
-            "rear tires throw a large cloud of white smoke.")
+    desc = ("A light-blue sports car drives across the real GitHub contribution graph. Each day "
+            "starts as an empty outline and lights up in a neon colour, by contribution level, as "
+            "the car passes. The rear tyres leave small puffs of smoke.")
     return svg_document(width, height, theme, "Car contribution animation", desc, layers)
 
 
